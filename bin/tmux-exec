@@ -594,6 +594,17 @@ def do_exec(
                     partial = raw_byte_buf.decode("utf-8", errors="replace")
                     partial_clean = strip_ansi(partial.rstrip())
                     if partial_clean:
+                        # In shell mode, capture-pane prompt detection is
+                        # disabled to avoid matching old prompts.  But if the
+                        # partial line itself matches a known REPL/debugger
+                        # prompt (e.g. "(Pdb) "), the shell command spawned an
+                        # interactive sub-program.  Return interactive_prompt
+                        # so the next call auto-switches to monitor mode.
+                        if shell_mode and any_output_seen:
+                            pt = detect_prompt_in_line(partial_clean, initial_prompt)
+                            if pt:
+                                status = "interactive_prompt"
+                                break
                         any_output_seen = True
 
                 if idle > 0.15 and any_output_seen:

@@ -168,6 +168,28 @@ tmux-exec detects interactive prompts and returns `interactive_prompt` status. W
    tmux-exec -t <pane> --check
    ```
 
+### Debuggers and REPLs (pdb, lldb, gdb, python, etc.)
+
+tmux-exec recognizes REPL and debugger prompts (`(Pdb)`, `(lldb)`, `(gdb)`, `>>>`, etc.) and returns `interactive_prompt`. Subsequent calls automatically switch to monitor mode, so you can send debugger commands directly.
+
+```bash
+# Launch lldb — disable its TUI status bar, which interferes with prompt detection
+tmux-exec -t <pane> "lldb -o 'settings set show-statusline false' /path/to/binary"
+# Now send debugger commands normally
+tmux-exec -t <pane> "b main"
+tmux-exec -t <pane> "r"
+tmux-exec -t <pane> "p some_var"
+tmux-exec -t <pane> "q"
+```
+
+For pdb and gdb, no special flags are needed:
+
+```bash
+tmux-exec -t <pane> "python3 -m pdb script.py"
+```
+
+After quitting the debugger, tmux-exec detects the shell prompt and automatically restores shell mode for the next call.
+
 ### Full-screen / interactive programs
 
 Programs like `vim`, `htop`, `less`, `top` don't produce linear output. Use `--raw` mode to send keystrokes:
