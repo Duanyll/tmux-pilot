@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# tmux-exec: Run a command in a tmux pane, stream filtered output, return exit code.
+# Usage: tmux-exec -t <target-pane> [-T <timeout>] <command...>
+#
+# Sends the command to the target pane via send-keys, streams pane output
+# to stdout in real time using pipe-pane + FIFO. Output is filtered to
+# strip ANSI escapes, handle CR-based progress bar overwrites, and
+# deduplicate consecutive identical lines. Exits with the remote command's
+# exit code once a unique marker is detected.
+
+set -uo pipefail
+
+TARGET=""
+TIMEOUT=0
+
+while getopts "t:T:" opt; do
+    case $opt in
+        t) TARGET="$OPTARG" ;;
+        T) TIMEOUT="$OPTARG" ;;
+        *) echo "Usage: tmux-exec -t <target-pane> [-T timeout_sec] command..." >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[[ -z "$TARGET" ]] && { echo "Error: -t target-pane is required" >&2; exit 1; }
+[[ $# -eq 0 ]] && { echo "Error: no command specified" >&2; exit 1; }
+
+CMD="$*"
+MARKER="__TXDONE_${RANDOM}${RANDOM}${RANDOM}__"
+
+FIFO=$(mktemp -u /tmp/tmux-exec-XXXXXX)
+mkfifo "$FIFO"
+
+cleanup() {
+    tmux pipe-pane -t "$TARGET" 2>/dev/null || true
+    rm -f "$FIFO"
+    [[ -n "${TIMEOUT_PID:-}" ]] && kill "$TIMEOUT_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Reject multi-line commands (use tmux-upload for file transfers)
+if [[ "$CMD" == *$'\n'* ]]; then
+    echo "Error: multi-line commands are not supported. Use tmux-upload for file transfers." >&2
+    exit 1
+fi
+
+# Stop any existing pipe-pane, then set up fresh
+tmux pipe-pane -t "$TARGET" 2>/dev/null || true
+exec 3<>"$FIFO"
+tmux pipe-pane -t "$TARGET" "cat > '$FIFO'"
+
+# Send command with marker suffix (leading space skips bash history)
+tmux send-keys -t "$TARGET" " ${CMD} ; printf '\\n${MARKER}%d\\n' \$?" Enter
+
+if [[ "$TIMEOUT" -gt 0 ]]; then
+    ( sleep "$TIMEOUT"; kill $$ 2>/dev/null ) &
+    TIMEOUT_PID=$!
+fi
+
+EXIT_CODE=1
+SKIP_FIRST=true
+PREV_LINE=""
+
+while true; do
+    if IFS= read -r -t 2 -u 3 line; then
+        # Strip ALL trailing CRs (pipe-pane may produce \r\r at line end)
+        while [[ "$line" == *$'\r' ]]; do line="${line%$'\r'}"; done
+
+        # Handle CR-based overwrites (progress bars): keep only text after last \r
+        [[ "$line" == *$'\r'* ]] && line="${line##*$'\r'}"
+
+        # Strip ANSI escape sequences (CSI, OSC, charset)
+        line=$(printf '%s' "$line" | LC_ALL=C sed $'s/\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][A-Z0-9]//g')
+
+        # Check for completion marker
+        if [[ "$line" =~ ${MARKER}([0-9]+) ]]; then
+            EXIT_CODE="${BASH_REMATCH[1]}"
+            break
+        fi
+
+        # Skip first line (echoed command — always the first line from pipe-pane)
+        if $SKIP_FIRST; then
+            SKIP_FIRST=false
+            continue
+        fi
+
+        # Skip marker printf echo
+        [[ "$line" == *"${MARKER}"* ]] && continue
+
+        # Skip empty / whitespace-only lines
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*$ ]] && continue
+
+        # Deduplicate consecutive identical lines (progress bar residue)
+        [[ "$line" == "$PREV_LINE" ]] && continue
+        PREV_LINE="$line"
+
+        printf '%s\n' "$line"
+    else
+        # read timed out — pipe-pane may have missed data; check capture-pane
+        CAPTURE=$(tmux capture-pane -t "$TARGET" -p -S -5 2>/dev/null || true)
+        if [[ "$CAPTURE" =~ ${MARKER}([0-9]+) ]]; then
+            EXIT_CODE="${BASH_REMATCH[1]}"
+            break
+        fi
+    fi
+done
+
+exec 3>&-
+exit "$EXIT_CODE"

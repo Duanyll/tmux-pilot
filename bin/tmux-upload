@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# tmux-upload: Upload a local file to a remote tmux pane via base64.
+# Usage: tmux-upload -t <target-pane> [-s] <local-file> <remote-path>
+#
+# Reads a local file, base64-encodes it, and sends it to the remote pane
+# via tmux-exec. The remote side decodes and writes the file.
+# Use -s to write via sudo tee (for protected paths).
+
+set -euo pipefail
+
+TMUX_EXEC="${TMUX_EXEC:-$(dirname "$0")/tmux-exec}"
+
+TARGET=""
+SUDO=false
+
+while getopts "t:s" opt; do
+    case $opt in
+        t) TARGET="$OPTARG" ;;
+        s) SUDO=true ;;
+        *) echo "Usage: tmux-upload -t <target-pane> [-s] <local-file> <remote-path>" >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[[ -z "$TARGET" ]] && { echo "Error: -t target-pane is required" >&2; exit 1; }
+[[ $# -lt 2 ]] && { echo "Error: local-file and remote-path are required" >&2; exit 1; }
+
+LOCAL_FILE="$1"
+REMOTE_PATH="$2"
+
+[[ ! -f "$LOCAL_FILE" ]] && { echo "Error: local file not found: $LOCAL_FILE" >&2; exit 1; }
+
+# Base64 encode, strip newlines to get a single line
+B64=$(base64 < "$LOCAL_FILE" | tr -d '\n')
+
+# Warn if the encoded data is very large (>64KB)
+if [[ ${#B64} -gt 65536 ]]; then
+    echo "Warning: file is large (${#B64} bytes encoded). This may be slow." >&2
+fi
+
+# Build the remote command
+if $SUDO; then
+    CMD="echo '${B64}' | base64 -d | sudo tee '${REMOTE_PATH}' > /dev/null"
+else
+    CMD="echo '${B64}' | base64 -d > '${REMOTE_PATH}'"
+fi
+
+# Execute via tmux-exec
+"$TMUX_EXEC" -t "$TARGET" "$CMD"
