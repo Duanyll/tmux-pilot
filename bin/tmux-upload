@@ -1,49 +1,105 @@
-#!/usr/bin/env bash
-# tmux-upload: Upload a local file to a remote tmux pane via base64.
-# Usage: tmux-upload -t <target-pane> [-s] <local-file> <remote-path>
-#
-# Reads a local file, base64-encodes it, and sends it to the remote pane
-# via tmux-exec. The remote side decodes and writes the file.
-# Use -s to write via sudo tee (for protected paths).
+#!/usr/bin/env python3
+"""tmux-upload: Upload a local file to a remote tmux pane via base64.
 
-set -euo pipefail
+Reads a local file, base64-encodes it, and sends the decode command to the
+remote pane via tmux-exec.  Refuses files larger than 48 KB (64 KB encoded)
+— use scp or manual chunking for large transfers.
+"""
 
-TMUX_EXEC="${TMUX_EXEC:-$(dirname "$0")/tmux-exec}"
+import argparse
+import base64
+import os
+import shlex
+import subprocess
+import sys
 
-TARGET=""
-SUDO=false
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-while getopts "t:s" opt; do
-    case $opt in
-        t) TARGET="$OPTARG" ;;
-        s) SUDO=true ;;
-        *) echo "Usage: tmux-upload -t <target-pane> [-s] <local-file> <remote-path>" >&2; exit 1 ;;
-    esac
-done
-shift $((OPTIND - 1))
+# 48 KB raw → ~64 KB base64.  Beyond this, tmux send-keys becomes unreliable
+# and transfers are slow.
+MAX_RAW_BYTES = 48 * 1024
 
-[[ -z "$TARGET" ]] && { echo "Error: -t target-pane is required" >&2; exit 1; }
-[[ $# -lt 2 ]] && { echo "Error: local-file and remote-path are required" >&2; exit 1; }
+TMUX_EXEC = os.environ.get(
+    "TMUX_EXEC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmux-exec")
+)
 
-LOCAL_FILE="$1"
-REMOTE_PATH="$2"
 
-[[ ! -f "$LOCAL_FILE" ]] && { echo "Error: local file not found: $LOCAL_FILE" >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# Structured output (mirrors tmux-exec format)
+# ---------------------------------------------------------------------------
 
-# Base64 encode, strip newlines to get a single line
-B64=$(base64 < "$LOCAL_FILE" | tr -d '\n')
+def emit(target: str, status: str, hint: str | None = None) -> None:
+    """Print a structured status line."""
+    line = f"[tmux-upload] target={target} status: {status}"
+    if hint:
+        line += f" | hint: {hint}"
+    print(line)
 
-# Warn if the encoded data is very large (>64KB)
-if [[ ${#B64} -gt 65536 ]]; then
-    echo "Warning: file is large (${#B64} bytes encoded). This may be slow." >&2
-fi
 
-# Build the remote command
-if $SUDO; then
-    CMD="echo '${B64}' | base64 -d | sudo tee '${REMOTE_PATH}' > /dev/null"
-else
-    CMD="echo '${B64}' | base64 -d > '${REMOTE_PATH}'"
-fi
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-# Execute via tmux-exec
-"$TMUX_EXEC" -t "$TARGET" "$CMD"
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Upload a local file to a remote tmux pane via base64.",
+        usage="tmux-upload -t <pane> [-s] [--force] <local-file> <remote-path>",
+    )
+    parser.add_argument("-t", dest="target", required=True,
+                        help="target pane (e.g., 0:0.0 or %%5)")
+    parser.add_argument("-s", "--sudo", action="store_true",
+                        help="write via sudo tee (for protected paths)")
+    parser.add_argument("--force", action="store_true",
+                        help="pass --force to tmux-exec (bypass pane-changed guard)")
+    parser.add_argument("local_file", metavar="local-file",
+                        help="path to the local file to upload")
+    parser.add_argument("remote_path", metavar="remote-path",
+                        help="destination path on the remote side")
+
+    args = parser.parse_args()
+
+    # --- Validate local file ---
+    if not os.path.isfile(args.local_file):
+        emit(args.target, "error", f"local file not found: {args.local_file}")
+        return 1
+
+    raw_size = os.path.getsize(args.local_file)
+    if raw_size > MAX_RAW_BYTES:
+        emit(
+            args.target, "rejected",
+            f"file too large ({raw_size} bytes, limit {MAX_RAW_BYTES}); "
+            "use scp, or split the file and upload chunks separately",
+        )
+        return 1
+
+    # --- Encode ---
+    with open(args.local_file, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+
+    # --- Build remote command ---
+    # Use printf instead of echo to avoid shell interpretation of escape
+    # sequences in the base64 payload (echo -e on some shells).
+    # shlex.quote handles paths with single quotes, spaces, etc.
+    safe_path = shlex.quote(args.remote_path)
+
+    if args.sudo:
+        cmd = f"printf '%s' '{b64}' | base64 -d | sudo tee {safe_path} > /dev/null"
+    else:
+        cmd = f"printf '%s' '{b64}' | base64 -d > {safe_path}"
+
+    # --- Execute via tmux-exec ---
+    exec_cmd = [TMUX_EXEC, "-t", args.target]
+    if args.force:
+        exec_cmd.append("--force")
+    exec_cmd.append(cmd)
+
+    result = subprocess.run(exec_cmd, capture_output=False)
+
+    # tmux-exec prints its own structured output; we just relay the exit code.
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

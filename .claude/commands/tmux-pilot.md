@@ -103,6 +103,22 @@ When the last call returned `interactive_prompt`, the next call automatically sw
 tmux-exec -t 0:0.0 "cd /etc/nginx && sudo nginx -t && sudo systemctl reload nginx"
 ```
 
+### CRITICAL: one tmux-exec per Bash call
+
+**Never chain or sequence multiple `tmux-exec` / `tmux-upload` invocations in a single Bash call** (e.g., `tmux-exec ... && tmux-exec ...` or `tmux-exec ...; tmux-exec ...`). tmux-exec does not always propagate exit codes reliably, so external chaining may not short-circuit as expected. Worse, if the first command hangs or the pane enters an unexpected state, the second `tmux-exec` will blindly send new keystrokes into that state.
+
+Instead, chain the remote commands **inside** a single tmux-exec call:
+
+```bash
+# WRONG — do not do this
+tmux-exec -t 0:0.0 "cd /app" && tmux-exec -t 0:0.0 "make build"
+
+# RIGHT — chain inside the remote command
+tmux-exec -t 0:0.0 "cd /app && make build"
+```
+
+Each Bash tool call should contain **at most one** `tmux-exec` or `tmux-upload` invocation.
+
 ### Quoting
 
 The command string is sent as literal keystrokes to the remote shell. Use proper shell quoting for the remote side:
@@ -114,6 +130,8 @@ tmux-exec -t 0:0.0 "grep 'error' /var/log/syslog | tail -20"
 ## Phase 2b: Upload files with tmux-upload
 
 To write files on the remote server, use `tmux-upload`. This tool base64-encodes a local file and decodes it on the remote side — avoiding all shell quoting and heredoc issues.
+
+**Size limit:** Files larger than 48 KB are rejected. For larger files, use `scp` or split the file and upload chunks separately.
 
 ### Basic usage
 
@@ -135,7 +153,23 @@ Use the `-s` flag to write via `sudo tee`:
 tmux-upload -t <pane> -s ./tmp/nginx-example.conf /etc/nginx/sites-available/example.conf
 ```
 
+### Options reference
+
+| Option | Description |
+|--------|-------------|
+| `-t TARGET` | Target pane (required, e.g., `0:0.0` or `%5`) |
+| `-s` / `--sudo` | Write via `sudo tee` (for protected paths) |
+| `--force` | Pass `--force` to tmux-exec (bypass pane-changed guard) |
+
 ### Workflow for editing remote files
+
+**For simple changes** (toggling a setting, changing a value, commenting a line), use `sed` directly — no need to download/upload:
+
+```bash
+tmux-exec -t <pane> "sudo sed -i 's/worker_connections 768/worker_connections 1024/' /etc/nginx/nginx.conf"
+```
+
+**For larger rewrites** (new files, multi-section edits), use the download → edit → upload workflow:
 
 1. Read the current file:
    ```bash
