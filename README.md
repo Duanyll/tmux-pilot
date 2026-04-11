@@ -2,19 +2,19 @@
 
 Let Claude Code control interactive CLI programs through tmux panes.
 
-tmux-pilot provides two shell scripts and a Claude Code skill that together allow Claude Code to execute commands in any tmux pane — local or remote (via SSH) — with streaming output, accurate exit codes, and clean filtered text.
+tmux-pilot provides scripts and a Claude Code skill that together allow Claude Code to execute commands in any tmux pane — local or remote (via SSH) — with intelligent output monitoring, completion detection, and structured status feedback.
 
 ## How it works
 
-- **`tmux-exec`** — Runs a command in a target tmux pane via `send-keys`, streams filtered output through a FIFO (`pipe-pane`), and returns the remote exit code. Handles ANSI stripping, progress bar collapsing, and line deduplication.
+- **`tmux-exec`** — Sends commands to a target tmux pane, monitors output in real time via `pipe-pane`, and returns when the command completes, a prompt appears, or a timeout is reached. Automatically detects shell vs non-shell environments, handles interactive prompts, and provides clean filtered output with exit codes.
 - **`tmux-upload`** — Uploads a local file to the target pane by base64-encoding it and decoding on the remote side. Supports `sudo tee` for protected paths.
-- **Claude Code skill** (`.claude/commands/tmux-pilot.md`) — Teaches Claude Code how to discover tmux panes, run commands, upload files, and handle interactive situations (sudo prompts, full-screen programs, long-running tasks).
+- **Claude Code skill** (`.claude/commands/tmux-pilot.md`) — Teaches Claude Code how to discover tmux panes, run commands, upload files, and handle interactive situations.
 
 ## Install
 
 ```bash
 # Clone the repo
-git clone https://github.com/user/tmux-pilot.git
+git clone https://github.com/duanyll/tmux-pilot.git
 cd tmux-pilot
 
 # Add the scripts to your PATH
@@ -35,8 +35,25 @@ ln -s "$(pwd)/.claude/commands/tmux-pilot.md" ~/.claude/commands/tmux-pilot.md
 2. In Claude Code, invoke the skill: `/tmux-pilot`
 3. Claude Code will discover the pane, confirm the target, and start executing commands
 
+### Quick examples
+
+```bash
+# Check what's on screen
+tmux-exec -t 0:0.0 --check
+
+# Run a command (auto-detects shell mode)
+tmux-exec -t 0:0.0 "ls -la /etc/nginx"
+
+# Send keystrokes to an interactive program
+tmux-exec -t 0:0.0 --raw "q"
+
+# Review scrollback history
+tmux-exec -t 0:0.0 --scroll 200
+```
+
 ## Requirements
 
 - tmux
-- bash 4+
-- base64 (coreutils)
+- Python 3.10+ (for `tmux-exec`)
+- bash 4+ (for `tmux-upload`)
+- base64 (coreutils, for `tmux-upload`)

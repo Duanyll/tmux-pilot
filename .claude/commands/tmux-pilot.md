@@ -1,6 +1,6 @@
 # Interactive CLI Control via tmux
 
-Execute commands and control interactive CLI programs through tmux panes using the `tmux-exec` wrapper. This gives you the same experience as running local Bash commands — streaming output, accurate exit codes, clean filtered text.
+Execute commands and control interactive CLI programs through tmux panes using the `tmux-exec` wrapper. It handles output monitoring, completion detection, and interactive prompt detection automatically — you get structured status information so you always know what happened.
 
 ## Phase 1: Identify the remote environment
 
@@ -18,19 +18,19 @@ If multiple SSH panes exist, confirm with the user which server they want before
 
 ### 1b. Confirm hostname and user
 
-Before running any operational commands, verify the remote context by inspecting the pane's current state:
+Inspect the pane's current state:
 
 ```bash
-tmux capture-pane -t <pane> -p -S -5
+tmux-exec -t <pane> --check
 ```
 
-This shows the last few lines including the shell prompt, which usually reveals `user@hostname`. If the prompt isn't informative enough, run an explicit check:
+This shows the current visible content including the shell prompt, which usually reveals `user@hostname`. If the prompt isn't informative enough, run an explicit check:
 
 ```bash
 tmux-exec -t <pane> "whoami && hostname && pwd"
 ```
 
-Report the remote identity (user, hostname, working directory) to the user before doing anything else. This is a safety check — especially important when the remote session might have root access.
+Report the remote identity (user, hostname, working directory) to the user before doing anything else.
 
 ## Phase 2: Run commands with tmux-exec
 
@@ -45,25 +45,63 @@ For example:
 tmux-exec -t 0:0.0 "sudo systemctl status nginx"
 ```
 
-The Bash tool's `timeout` parameter applies — set it appropriately for long commands (max 600000ms = 10 min).
+### Understanding the output
+
+tmux-exec returns structured output with a status line:
+
+```
+[tmux-exec] target=0:0.0 mode=shell duration=3.2s
+[tmux-exec] status: command_completed | exit_code=0
+--- output (5 lines, incremental) ---
+...actual output...
+--- end ---
+```
+
+**Status values and what to do:**
+
+| Status | Meaning | Next action |
+|--------|---------|-------------|
+| `command_completed` | Command finished (exit code available) | Continue with next command |
+| `prompt_detected` | Shell prompt reappeared (likely finished) | Continue normally |
+| `interactive_prompt` | Pane is waiting for user input | Send input or tell the user |
+| `output_stable` | No output for idle_timeout seconds | Check pane state, command may still be running |
+| `output_flood` | Too much output, returned early | Use `--scroll N` to review history |
+| `timeout` | Hit the total timeout limit | Command is still running; use `--check` later |
+| `pane_changed` | Pane content changed since last call | Review the output, use `--force` if safe |
+| `pane_error` | Pane not found or tmux error | Check the target pane identifier |
+
+### Options reference
+
+| Option | Description |
+|--------|-------------|
+| `-t TARGET` | Target pane (required, e.g., `0:0.0` or `%5`) |
+| `--check` | Return current pane state without sending anything |
+| `--raw` | Send keys and return immediately (no monitoring) |
+| `--force` | Bypass the pane-changed guard |
+| `--shell` | Force shell mode (append printf marker for exit code) |
+| `--no-shell` | Force non-shell mode (no marker) |
+| `--scroll N` | Return N lines of scrollback history |
+| `--timeout N` | Total timeout in seconds (default: 110) |
+| `--idle-timeout N` | Seconds of no output before returning (default: 10) |
+
+### Shell mode vs monitor mode
+
+tmux-exec auto-detects whether the pane is running a shell (bash, zsh, ssh, etc.) or something else (python, gdb, etc.):
+
+- **Shell mode** (auto for shell/ssh): Appends a printf marker to reliably detect completion and capture exit code.
+- **Monitor mode** (auto for non-shell): Relies on prompt detection and output stabilization. No exit code.
+
+Override with `--shell` or `--no-shell` when auto-detection is wrong.
+
+When the last call returned `interactive_prompt`, the next call automatically switches to monitor mode — it sends your input directly to the waiting program without a marker.
 
 ### Important: single-line commands only
 
-**tmux-exec only accepts single-line commands.** Do NOT use heredocs, multi-line strings, or newlines in the command. If you need to write a file to the remote server, use `tmux-upload` (see Phase 2b below).
-
-For multi-command operations, chain with `&&`, `||`, or `;` on a single line:
+**tmux-exec only accepts single-line commands.** Do NOT use heredocs, multi-line strings, or newlines. For multi-command operations, chain with `&&`, `||`, or `;`:
 
 ```bash
 tmux-exec -t 0:0.0 "cd /etc/nginx && sudo nginx -t && sudo systemctl reload nginx"
 ```
-
-### How tmux-exec works
-
-- Sends the command via `tmux send-keys`
-- Captures output in real time via `tmux pipe-pane` + FIFO, with `capture-pane` fallback
-- Filters raw PTY output: strips ANSI escapes, collapses CR-based progress bars, deduplicates consecutive lines, removes command echo
-- Detects a unique completion marker to know when the command finishes
-- Returns the remote command's exit code
 
 ### Quoting
 
@@ -115,57 +153,59 @@ tmux-upload -t <pane> -s ./tmp/nginx-example.conf /etc/nginx/sites-available/exa
 
 ## Phase 3: Interactive and special situations
 
-The user can always interact with the remote terminal directly through the tmux window. Use this to your advantage — when something requires human input, fall back to `send-keys` + `capture-pane` mode.
+tmux-exec handles most interactive situations automatically. The user can always interact with the remote terminal directly through the tmux window.
 
-### sudo password prompt
+### Interactive prompts (password, y/N, etc.)
 
-If a command needs a sudo password, use this workflow:
+tmux-exec detects interactive prompts and returns `interactive_prompt` status. When you see this:
 
-1. Send the command via `tmux send-keys`:
+1. If you know the answer (e.g., "y" for a confirmation): just call tmux-exec again with the answer — it will automatically send it without a marker:
    ```bash
-   tmux send-keys -t <pane> "sudo apt upgrade -y" Enter
+   tmux-exec -t <pane> "y"
    ```
-2. Tell the user: "I've sent the command. It may be waiting for your sudo password — please check the tmux window and enter it."
-3. After the user confirms they've entered the password (or after a reasonable wait), poll the result:
+2. If it needs user input (e.g., a password): tell the user to enter it in the tmux window, then use `--check` to see the result:
    ```bash
-   tmux capture-pane -t <pane> -p -S -30
+   tmux-exec -t <pane> --check
    ```
-4. Once the output shows the command has completed, resume using tmux-exec for subsequent commands.
 
 ### Full-screen / interactive programs
 
-Programs like `vim`, `htop`, `less`, `top`, `journalctl` (pager mode) don't produce linear output and won't work through tmux-exec. Use the send-keys + capture-pane pattern:
-
-1. Launch the program:
-   ```bash
-   tmux send-keys -t <pane> "htop" Enter
-   ```
-2. Tell the user the program is running and they can interact with it in tmux.
-3. When they're done, capture the pane to see the current state or confirm they've exited:
-   ```bash
-   tmux capture-pane -t <pane> -p -S -20
-   ```
-
-### Long-running commands (>10 min)
-
-For operations that may exceed the Bash tool timeout:
-
-- **Background on remote**: `tmux-exec -t <pane> "nohup long-command > /tmp/output.log 2>&1 &"`
-- **send-keys + poll**: Send the command, then periodically capture-pane to check progress:
-  ```bash
-  tmux send-keys -t <pane> "long-running-command" Enter
-  ```
-  Later:
-  ```bash
-  tmux capture-pane -t <pane> -p -S -50
-  ```
-
-### Checking pane state at any time
-
-If you need to see what's currently on screen (e.g., to check if a previous command finished, or see an error message the user mentioned):
+Programs like `vim`, `htop`, `less`, `top` don't produce linear output. Use `--raw` mode to send keystrokes:
 
 ```bash
-tmux capture-pane -t <pane> -p -S -30
+# Launch the program
+tmux-exec -t <pane> --raw "htop"
+
+# Send keystrokes (e.g., quit)
+tmux-exec -t <pane> --raw "q"
+
+# Check what's on screen
+tmux-exec -t <pane> --check
 ```
 
-This is always safe and doesn't affect the remote terminal.
+### Pane change guard
+
+tmux-exec tracks pane state between calls. If the pane content changed unexpectedly (user typed something, background process output), it returns `pane_changed` instead of executing. This prevents blindly sending commands into an unknown state.
+
+When you see `pane_changed`:
+1. Review the returned output to understand what changed
+2. If it's safe to proceed, use `--force`:
+   ```bash
+   tmux-exec -t <pane> --force "<command>"
+   ```
+
+### Long-running commands
+
+For operations that may exceed the default timeout (110s):
+
+- **Increase timeout**: `tmux-exec -t <pane> --timeout 300 "long-command"` (up to 600s with Bash tool timeout)
+- **Background on remote**: `tmux-exec -t <pane> "nohup long-command > /tmp/output.log 2>&1 &"`
+- **Check progress**: `tmux-exec -t <pane> --check`
+
+### Reviewing scrollback
+
+When output was truncated (flood) or you need to see history:
+
+```bash
+tmux-exec -t <pane> --scroll 200
+```

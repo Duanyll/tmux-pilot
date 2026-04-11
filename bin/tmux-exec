@@ -1,109 +1,838 @@
-#!/usr/bin/env bash
-# tmux-exec: Run a command in a tmux pane, stream filtered output, return exit code.
-# Usage: tmux-exec -t <target-pane> [-T <timeout>] <command...>
-#
-# Sends the command to the target pane via send-keys, streams pane output
-# to stdout in real time using pipe-pane + FIFO. Output is filtered to
-# strip ANSI escapes, handle CR-based progress bar overwrites, and
-# deduplicate consecutive identical lines. Exits with the remote command's
-# exit code once a unique marker is detected.
+#!/usr/bin/env python3
+"""tmux-exec: Run commands in tmux panes with intelligent output monitoring.
 
-set -uo pipefail
+Sends keystrokes to a target tmux pane, monitors output in real time, and
+returns when the command completes, a prompt appears, or a timeout is reached.
+Provides structured status information so the caller always knows what happened.
+"""
 
-TARGET=""
-TIMEOUT=0
+import argparse
+import atexit
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 
-while getopts "t:T:" opt; do
-    case $opt in
-        t) TARGET="$OPTARG" ;;
-        T) TIMEOUT="$OPTARG" ;;
-        *) echo "Usage: tmux-exec -t <target-pane> [-T timeout_sec] command..." >&2; exit 1 ;;
-    esac
-done
-shift $((OPTIND - 1))
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-[[ -z "$TARGET" ]] && { echo "Error: -t target-pane is required" >&2; exit 1; }
-[[ $# -eq 0 ]] && { echo "Error: no command specified" >&2; exit 1; }
+STATE_DIR_BASE = "/tmp/tmux-pilot"
 
-CMD="$*"
-MARKER="__TXDONE_${RANDOM}${RANDOM}${RANDOM}__"
+MARKER_PREFIX = "__TXDONE_"
 
-FIFO=$(mktemp -u /tmp/tmux-exec-XXXXXX)
-mkfifo "$FIFO"
-
-cleanup() {
-    tmux pipe-pane -t "$TARGET" 2>/dev/null || true
-    rm -f "$FIFO"
-    [[ -n "${TIMEOUT_PID:-}" ]] && kill "$TIMEOUT_PID" 2>/dev/null || true
+SHELL_COMMANDS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "csh", "tcsh", "ash"}
+SHELL_LIKE_COMMANDS = {"ssh", "sshd", "mosh-client", "mosh-server"}
+NON_SHELL_COMMANDS = {
+    "python", "python3", "python2", "ipython", "node", "gdb", "lldb",
+    "mysql", "psql", "sqlite3", "redis-cli", "mongo", "irb", "ruby",
+    "lua", "ghci", "erl", "iex", "scala", "R", "julia",
 }
-trap cleanup EXIT INT TERM
 
-# Reject multi-line commands (use tmux-upload for file transfers)
-if [[ "$CMD" == *$'\n'* ]]; then
-    echo "Error: multi-line commands are not supported. Use tmux-upload for file transfers." >&2
-    exit 1
-fi
+PROMPT_PATTERNS = [
+    re.compile(r"[$#%]\s*$"),                        # common endings (no > — too many false positives)
+    re.compile(r"^>\s*$"),                           # continuation prompt (bare > at line start only)
+    re.compile(r"\w+@[\w.-]+[:#~/].*[$#%]\s*$"),     # user@host:path$
+    re.compile(r">>>\s*$"),                           # Python REPL
+    re.compile(r"\(gdb\)\s*$"),                       # gdb
+    re.compile(r"\(Pdb\)\s*$"),                       # Python debugger
+    re.compile(r"\(lldb\)\s*$"),                      # lldb
+    re.compile(r"mysql>\s*$"),                        # mysql
+    re.compile(r"[\u276f\u279c\u25b6]\s*$"),          # starship arrows
+    re.compile(r"irb\(.*\):\d+:\d+[>*]\s*$"),        # Ruby REPL
+    re.compile(r"In \[\d+\]:\s*$"),                   # IPython
+]
 
-# Stop any existing pipe-pane, then set up fresh
-tmux pipe-pane -t "$TARGET" 2>/dev/null || true
-exec 3<>"$FIFO"
-tmux pipe-pane -t "$TARGET" "cat > '$FIFO'"
+INTERACTIVE_KEYWORDS = re.compile(
+    r"(?i)(password|passphrase|yes/no|y/n|y/N|Y/n|continue|confirm|"
+    r"enter|press|overwrite|proceed|abort|retry|choice|select|option)",
+)
+INTERACTIVE_ENDINGS = re.compile(r"[:\?>]\s*$")
 
-# Send command with marker suffix (leading space skips bash history)
-tmux send-keys -t "$TARGET" " ${CMD} ; printf '\\n${MARKER}%d\\n' \$?" Enter
+# ANSI: SGR is fine (colors), but cursor movement / screen control is "heavy"
+CSI_SGR = re.compile(r"\x1b\[\d*(?:;\d+)*m")
+# Cursor POSITIONING, line/screen ERASE — these make incremental text unreliable.
+# Excluded: mode set/reset (h/l with ? prefix), cursor show/hide, device status (n),
+# cursor save/restore (s/u) — these don't affect text layout.
+CSI_HEAVY = re.compile(
+    r"\x1b\["                       # CSI
+    r"\d*(?:;\d+)*"                 # params (no ? prefix — mode sets use ?)
+    r"[ABCDEFGHJKfST]"             # cursor move (A-G,H,f) / erase (J,K) / scroll (S,T)
+)
+ALTERNATE_SCREEN = re.compile(r"\x1b\[\?(?:1049|47|1047)[hl]")
+ANSI_ALL = re.compile(
+    r"\x1b\[[?0-9;]*[a-zA-Z]"     # CSI sequences
+    r"|\x1b\][^\x07]*\x07"         # OSC sequences
+    r"|\x1b[()][A-Z0-9]"           # charset switches (G0/G1 set)
+    r"|\x1b[=>78cNODHMPXZn\\]"    # ESC single-char: keypad modes (=/>), cursor
+                                    # save/restore (7/8), reset (c), SS2/SS3, etc.
+)
 
-if [[ "$TIMEOUT" -gt 0 ]]; then
-    ( sleep "$TIMEOUT"; kill $$ 2>/dev/null ) &
-    TIMEOUT_PID=$!
-fi
+FLOOD_LINE_THRESHOLD = 500
+MAX_LINE_BYTES = 65536
 
-EXIT_CODE=1
-SKIP_FIRST=true
-PREV_LINE=""
 
-while true; do
-    if IFS= read -r -t 2 -u 3 line; then
-        # Strip ALL trailing CRs (pipe-pane may produce \r\r at line end)
-        while [[ "$line" == *$'\r' ]]; do line="${line%$'\r'}"; done
+# ---------------------------------------------------------------------------
+# Tmux helpers
+# ---------------------------------------------------------------------------
 
-        # Handle CR-based overwrites (progress bars): keep only text after last \r
-        [[ "$line" == *$'\r'* ]] && line="${line##*$'\r'}"
+def tmux_run(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+    """Run a tmux subcommand, returning CompletedProcess."""
+    cmd = ["tmux"] + list(args)
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
-        # Strip ANSI escape sequences (CSI, OSC, charset)
-        line=$(printf '%s' "$line" | LC_ALL=C sed $'s/\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][A-Z0-9]//g')
 
-        # Check for completion marker
-        if [[ "$line" =~ ${MARKER}([0-9]+) ]]; then
-            EXIT_CODE="${BASH_REMATCH[1]}"
-            break
-        fi
+def tmux_capture(target: str, lines: int | None = None) -> str | None:
+    """Capture pane content.  Returns None on failure (pane gone)."""
+    cmd = ["capture-pane", "-t", target, "-p"]
+    if lines is not None:
+        cmd += ["-S", str(-lines)]
+    r = tmux_run(*cmd)
+    if r.returncode != 0:
+        return None
+    return r.stdout
 
-        # Skip first line (echoed command — always the first line from pipe-pane)
-        if $SKIP_FIRST; then
-            SKIP_FIRST=false
-            continue
-        fi
 
-        # Skip marker printf echo
-        [[ "$line" == *"${MARKER}"* ]] && continue
+def tmux_pane_command(target: str) -> str | None:
+    """Return the current foreground command in the pane."""
+    r = tmux_run("display-message", "-t", target, "-p", "#{pane_current_command}")
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
 
-        # Skip empty / whitespace-only lines
-        [[ -z "$line" || "$line" =~ ^[[:space:]]*$ ]] && continue
 
-        # Deduplicate consecutive identical lines (progress bar residue)
-        [[ "$line" == "$PREV_LINE" ]] && continue
-        PREV_LINE="$line"
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
 
-        printf '%s\n' "$line"
-    else
-        # read timed out — pipe-pane may have missed data; check capture-pane
-        CAPTURE=$(tmux capture-pane -t "$TARGET" -p -S -5 2>/dev/null || true)
-        if [[ "$CAPTURE" =~ ${MARKER}([0-9]+) ]]; then
-            EXIT_CODE="${BASH_REMATCH[1]}"
-            break
-        fi
-    fi
-done
+def state_dir(target: str) -> str:
+    """Return the per-pane state directory path."""
+    safe = target.replace("/", "_").replace(":", "_").replace(".", "_")
+    return os.path.join(STATE_DIR_BASE, safe)
 
-exec 3>&-
-exit "$EXIT_CODE"
+
+def load_state(target: str) -> dict:
+    """Load saved state for a pane."""
+    d = state_dir(target)
+    st: dict = {}
+    for name in ("last_capture", "last_prompt", "last_status"):
+        path = os.path.join(d, f"{name}.txt")
+        if os.path.isfile(path):
+            with open(path, "r", errors="replace") as f:
+                content = f.read()
+                # Strip single-value files, preserve capture verbatim
+                st[name] = content if name == "last_capture" else content.strip()
+    return st
+
+
+def save_state(
+    target: str,
+    capture: str | None,
+    prompt: str | None,
+    status: str | None = None,
+) -> None:
+    """Persist state for next invocation."""
+    d = state_dir(target)
+    os.makedirs(d, exist_ok=True)
+    if capture is not None:
+        with open(os.path.join(d, "last_capture.txt"), "w") as f:
+            f.write(capture)
+    if prompt is not None:
+        with open(os.path.join(d, "last_prompt.txt"), "w") as f:
+            f.write(prompt)
+    if status is not None:
+        with open(os.path.join(d, "last_status.txt"), "w") as f:
+            f.write(status)
+
+
+# ---------------------------------------------------------------------------
+# Output classification & processing
+# ---------------------------------------------------------------------------
+
+def strip_ansi(line: str) -> str:
+    return ANSI_ALL.sub("", line)
+
+
+def process_line(raw: str) -> str:
+    """Process a raw pipe-pane line.  Returns cleaned text."""
+    # Strip trailing CRs
+    while raw.endswith("\r"):
+        raw = raw[:-1]
+    # Handle CR-based overwrites (progress bars): keep text after last \r
+    if "\r" in raw:
+        raw = raw.rsplit("\r", 1)[-1]
+    return strip_ansi(raw)
+
+
+# ---------------------------------------------------------------------------
+# Prompt / interactive detection
+# ---------------------------------------------------------------------------
+
+def normalize_capture(text: str) -> str:
+    """Normalize capture-pane output for comparison."""
+    lines = text.strip("\n").split("\n")
+    # Strip leading and trailing empty lines, strip trailing whitespace per line
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(l.rstrip() for l in lines)
+
+
+def get_last_visible_line(target: str) -> str | None:
+    """Get the last non-empty line currently visible in the pane."""
+    cap = tmux_capture(target, lines=5)
+    if cap is None:
+        return None
+    lines = cap.rstrip("\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return strip_ansi(lines[-1].rstrip()) if lines else None
+
+
+def detect_prompt_in_line(line: str, initial_prompt: str | None) -> str | None:
+    """Check if a line looks like a shell/REPL prompt.
+
+    Returns 'fast' for exact initial_prompt match, 'slow' for pattern match,
+    or None.
+    """
+    stripped = line.rstrip()
+    if not stripped:
+        return None
+    # Fast path: exact match with initial prompt
+    if initial_prompt and stripped == initial_prompt:
+        return "fast"
+    # Slow path: known patterns
+    for pat in PROMPT_PATTERNS:
+        if pat.search(stripped):
+            return "slow"
+    return None
+
+
+def score_interactive_prompt(line: str, is_last_line: bool) -> int:
+    """Score how likely a line is an interactive prompt.  >=2 means yes."""
+    score = 0
+    stripped = line.rstrip()
+    if not stripped:
+        return 0
+    if is_last_line:
+        score += 1
+    if len(stripped) < 80:
+        score += 1
+    if INTERACTIVE_ENDINGS.search(stripped):
+        score += 1
+    if INTERACTIVE_KEYWORDS.search(stripped):
+        score += 1
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Shell mode detection
+# ---------------------------------------------------------------------------
+
+def detect_shell_mode(target: str) -> bool:
+    """Heuristic: is the pane running a shell?"""
+    cmd = tmux_pane_command(target)
+    if cmd is None:
+        return False
+    base = os.path.basename(cmd)
+    if base in SHELL_COMMANDS:
+        return True
+    if base in SHELL_LIKE_COMMANDS:
+        return True
+    if base in NON_SHELL_COMMANDS:
+        return False
+    return False  # safe default
+
+
+# ---------------------------------------------------------------------------
+# Structured output
+# ---------------------------------------------------------------------------
+
+def format_output(
+    target: str,
+    mode: str,
+    duration: float,
+    status: str,
+    exit_code: int | None,
+    lines: list[str],
+    hint: str | None = None,
+    capture_mode: bool = False,
+) -> None:
+    """Print structured output to stdout."""
+    header = f"[tmux-exec] target={target} mode={mode} duration={duration:.1f}s"
+    status_line = f"[tmux-exec] status: {status}"
+    if exit_code is not None:
+        status_line += f" | exit_code={exit_code}"
+    if hint:
+        status_line += f" | hint: {hint}"
+
+    print(header)
+    print(status_line)
+
+    if lines:
+        src = "capture-pane" if capture_mode else "incremental"
+        print(f"--- output ({len(lines)} lines, {src}) ---")
+        for l in lines:
+            print(l)
+        print("--- end ---")
+    else:
+        print("--- no output ---")
+
+
+# ---------------------------------------------------------------------------
+# FIFO management
+# ---------------------------------------------------------------------------
+
+class PipePaneMonitor:
+    """Manages pipe-pane → FIFO → non-blocking reads."""
+
+    def __init__(self, target: str):
+        self.target = target
+        self.fifo_path = tempfile.mktemp(prefix="tmux-exec-", dir="/tmp")
+        self.fd: int | None = None
+        self._setup()
+
+    def _setup(self) -> None:
+        os.mkfifo(self.fifo_path)
+        # Clear any existing pipe-pane
+        tmux_run("pipe-pane", "-t", self.target)
+        # Open FIFO read+write (O_RDWR prevents blocking on open when no writer yet)
+        self.fd = os.open(self.fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        # Start pipe-pane writing to our FIFO
+        r = tmux_run("pipe-pane", "-t", self.target, f"cat > '{self.fifo_path}'")
+        if r.returncode != 0:
+            raise RuntimeError(f"pipe-pane failed: {r.stderr.strip()}")
+
+    def poll(self, timeout: float = 0.1) -> bytes:
+        """Poll for data.  Returns b'' if nothing available within timeout."""
+        if self.fd is None:
+            return b""
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if ready:
+            try:
+                return os.read(self.fd, 65536)
+            except OSError:
+                return b""
+        return b""
+
+    def cleanup(self) -> None:
+        """Stop pipe-pane and remove FIFO."""
+        tmux_run("pipe-pane", "-t", self.target)
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        try:
+            os.unlink(self.fifo_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def do_check(target: str, scroll: int | None) -> int:
+    """--check mode: return current pane state."""
+    lines_arg = scroll if scroll else None
+    cap = tmux_capture(target, lines=lines_arg)
+    if cap is None:
+        format_output(target, "check", 0.0, "pane_error", None, [],
+                      hint="target pane not found")
+        return 1
+    save_state(target, cap, None)
+    out_lines = cap.rstrip("\n").split("\n")
+    format_output(target, "check", 0.0, "ok", None, out_lines, capture_mode=True)
+    return 0
+
+
+def do_raw(target: str, command: str) -> int:
+    """--raw mode: send keys and return immediately."""
+    r = tmux_run("send-keys", "-t", target, command, "Enter")
+    if r.returncode != 0:
+        format_output(target, "raw", 0.0, "pane_error", None, [],
+                      hint=f"send-keys failed: {r.stderr.strip()}")
+        return 1
+    format_output(target, "raw", 0.0, "sent", None, [],
+                  hint="keys sent, use --check to inspect pane")
+    return 0
+
+
+def do_scroll(target: str, scroll: int) -> int:
+    """--scroll mode: return scrollback history."""
+    cap = tmux_capture(target, lines=scroll)
+    if cap is None:
+        format_output(target, "scroll", 0.0, "pane_error", None, [],
+                      hint="target pane not found")
+        return 1
+    out_lines = cap.rstrip("\n").split("\n")
+    format_output(target, "scroll", 0.0, "ok", None, out_lines, capture_mode=True)
+    return 0
+
+
+def do_exec(
+    target: str,
+    command: str,
+    shell_mode: bool,
+    timeout: float,
+    idle_timeout: float,
+    force: bool,
+) -> int:
+    """Main execution mode: send command, monitor output, return on completion."""
+    start = time.monotonic()
+    mode_str = "shell" if shell_mode else "monitor"
+
+    # --- Pane change guard ---
+    current_cap = tmux_capture(target)
+    if current_cap is None:
+        format_output(target, mode_str, 0.0, "pane_error", None, [],
+                      hint="target pane not found")
+        return 1
+
+    saved = load_state(target)
+
+    # If last call returned interactive_prompt and pane hasn't changed,
+    # auto-switch to non-shell mode — we're feeding input to a running program.
+    if (
+        shell_mode
+        and saved.get("last_status") == "interactive_prompt"
+        and "last_capture" in saved
+        and normalize_capture(saved["last_capture"]) == normalize_capture(current_cap)
+    ):
+        shell_mode = False
+        mode_str = "monitor"
+
+    if not force:
+        if "last_capture" in saved:
+            norm_saved = normalize_capture(saved["last_capture"])
+            norm_current = normalize_capture(current_cap)
+            if norm_saved != norm_current:
+                save_state(target, current_cap, None, status="pane_changed")
+                out_lines = current_cap.rstrip("\n").split("\n")
+                format_output(
+                    target, mode_str, 0.0, "pane_changed", None, out_lines,
+                    hint="pane content changed since last call; review before proceeding (use --force to bypass)",
+                    capture_mode=True,
+                )
+                return 0
+
+    # --- Guard: previous command may still be running ---
+    if (
+        not force
+        and saved.get("last_status") in ("output_stable", "timeout")
+        and "last_capture" in saved
+        and normalize_capture(saved["last_capture"]) == normalize_capture(current_cap)
+    ):
+        save_state(target, current_cap, None, status="still_running")
+        out_lines = current_cap.rstrip("\n").split("\n")
+        format_output(
+            target, mode_str, 0.0, "still_running", None, out_lines,
+            hint="previous command may still be running (pane unchanged since last output_stable/timeout); use --force to send anyway or --check to inspect",
+            capture_mode=True,
+        )
+        return 0
+
+    # --- Capture initial prompt ---
+    initial_prompt = get_last_visible_line(target)
+
+    # --- Generate marker ---
+    marker = f"{MARKER_PREFIX}{os.getpid()}_{int(time.monotonic() * 1000)}_"
+    marker_re = re.compile(re.escape(marker) + r"(\d+)")
+
+    # --- Setup pipe-pane ---
+    monitor: PipePaneMonitor | None = None
+    try:
+        monitor = PipePaneMonitor(target)
+    except RuntimeError as e:
+        format_output(target, mode_str, 0.0, "pane_error", None, [],
+                      hint=str(e))
+        return 1
+
+    def cleanup():
+        if monitor:
+            monitor.cleanup()
+
+    atexit.register(cleanup)
+
+    # Handle signals for cleanup
+    orig_sigterm = signal.getsignal(signal.SIGTERM)
+    orig_sigint = signal.getsignal(signal.SIGINT)
+
+    def sig_handler(signum, frame):
+        cleanup()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
+
+    # --- Send command ---
+    if shell_mode:
+        full_cmd = f" {command} ; printf '\\n{marker}%d\\n' $?"
+    else:
+        full_cmd = command
+
+    # Reject multi-line commands
+    if "\n" in full_cmd:
+        cleanup()
+        print("Error: multi-line commands are not supported. Use tmux-upload for file transfers.", file=sys.stderr)
+        return 1
+
+    r = tmux_run("send-keys", "-t", target, full_cmd, "Enter")
+    if r.returncode != 0:
+        cleanup()
+        format_output(target, mode_str, time.monotonic() - start, "pane_error",
+                      None, [], hint=f"send-keys failed: {r.stderr.strip()}")
+        return 1
+
+    # --- Monitor loop ---
+    text_buffer: list[str] = []
+    raw_byte_buf = b""
+    last_output_time = time.monotonic()
+    exit_code: int | None = None
+    status = "timeout"
+    heavy_seq_count = 0  # total CSI_HEAVY sequences seen in command output
+    skip_first_line = True  # skip echoed command
+    prev_line = ""
+    any_output_seen = False  # gate prompt detection until pipe-pane has data
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                status = "timeout"
+                break
+
+            # Poll for data
+            remaining = min(0.1, timeout - elapsed)
+            data = monitor.poll(timeout=remaining)
+
+            if data:
+                raw_byte_buf += data
+                last_output_time = time.monotonic()
+
+                # Process complete lines
+                while b"\n" in raw_byte_buf:
+                    line_bytes, raw_byte_buf = raw_byte_buf.split(b"\n", 1)
+
+                    # Enforce max line length
+                    if len(line_bytes) > MAX_LINE_BYTES:
+                        line_bytes = line_bytes[:MAX_LINE_BYTES]
+
+                    raw_line = line_bytes.decode("utf-8", errors="replace")
+                    cleaned = process_line(raw_line)
+
+                    # Check for marker (before any skip logic)
+                    m = marker_re.search(cleaned)
+                    if not m:
+                        # Also check raw line in case ANSI stripping mangled it
+                        m = marker_re.search(raw_line)
+                    if m:
+                        exit_code = int(m.group(1))
+                        status = "command_completed"
+                        break
+
+                    # Skip echoed command (first line from pipe-pane)
+                    if skip_first_line:
+                        skip_first_line = False
+                        continue
+
+                    # Skip marker-related lines
+                    if MARKER_PREFIX in cleaned:
+                        continue
+
+                    # Skip empty lines
+                    if not cleaned.strip():
+                        continue
+
+                    # Deduplicate consecutive identical lines
+                    if cleaned == prev_line:
+                        continue
+                    prev_line = cleaned
+
+                    # This line is real command output (past all skip filters)
+                    any_output_seen = True
+
+                    heavy_seq_count += len(CSI_HEAVY.findall(raw_line))
+                    text_buffer.append(cleaned)
+
+                    # In shell mode, also check pipe-pane lines for prompts.
+                    # This catches the Ctrl-C case where marker never arrives
+                    # but a new prompt appears in the actual data stream.
+                    # Only trigger if we've already seen some output (to avoid
+                    # matching echo noise).
+                    if shell_mode and any_output_seen:
+                        pt = detect_prompt_in_line(cleaned, initial_prompt)
+                        if pt:
+                            # Remove the prompt line from text_buffer
+                            text_buffer.pop()
+                            status = "prompt_detected"
+                            break
+
+                if status in ("command_completed", "prompt_detected"):
+                    break
+
+                # Flood detection
+                if len(text_buffer) > FLOOD_LINE_THRESHOLD:
+                    status = "output_flood"
+                    break
+
+            else:
+                # No data received
+                idle = time.monotonic() - last_output_time
+
+                # Check for partial line in buffer (no trailing \n) — this
+                # catches interactive prompts like "Name: " or "Password:"
+                # that don't end with newline.
+                if raw_byte_buf and idle > 0.15:
+                    partial = raw_byte_buf.decode("utf-8", errors="replace")
+                    partial_clean = strip_ansi(partial.rstrip())
+                    if partial_clean:
+                        any_output_seen = True
+
+                if idle > 0.15 and any_output_seen:
+                    # --- Prompt detection (only after 150ms idle AND some output seen) ---
+                    # Without any_output_seen gate, we'd match old prompt content
+                    # still visible on screen right after sending the command.
+
+                    # Use capture-pane for prompt detection (more reliable than
+                    # pipe-pane buffer which may have ANSI artifacts)
+                    cap = tmux_capture(target, lines=3)
+                    if cap is None:
+                        status = "pane_error"
+                        break
+
+                    cap_lines = cap.rstrip("\n").split("\n")
+                    while cap_lines and not cap_lines[-1].strip():
+                        cap_lines.pop()
+
+                    if cap_lines:
+                        last_line = strip_ansi(cap_lines[-1].rstrip())
+
+                        # Check for marker in capture (shell mode)
+                        if shell_mode:
+                            for cl in cap_lines:
+                                m = marker_re.search(cl)
+                                if m:
+                                    exit_code = int(m.group(1))
+                                    status = "command_completed"
+                                    break
+                            if status == "command_completed":
+                                break
+
+                        # Shell prompt detection — only in non-shell mode.
+                        # In shell mode we have a marker; capture-pane prompt
+                        # detection would match OLD prompts still visible on
+                        # screen, causing premature return.
+                        if not shell_mode:
+                            prompt_type = detect_prompt_in_line(last_line, initial_prompt)
+                            if prompt_type:
+                                status = "prompt_detected"
+                                # Drain remaining pipe-pane data before returning
+                                drain_until = time.monotonic() + 0.3
+                                while time.monotonic() < drain_until:
+                                    d = monitor.poll(timeout=0.05)
+                                    if d:
+                                        raw_byte_buf += d
+                                        while b"\n" in raw_byte_buf:
+                                            lb, raw_byte_buf = raw_byte_buf.split(b"\n", 1)
+                                            if len(lb) > MAX_LINE_BYTES:
+                                                lb = lb[:MAX_LINE_BYTES]
+                                            rl = lb.decode("utf-8", errors="replace")
+                                            cl = process_line(rl)
+                                            if MARKER_PREFIX in cl:
+                                                continue
+                                            if not cl.strip():
+                                                continue
+                                            if cl == prev_line:
+                                                continue
+                                            prev_line = cl
+                                            heavy_seq_count += len(CSI_HEAVY.findall(rl))
+                                            text_buffer.append(cl)
+                                break
+
+                        # Interactive prompt detection
+                        score = score_interactive_prompt(last_line, True)
+                        if score >= 3:
+                            status = "interactive_prompt"
+                            break
+
+                if idle > idle_timeout:
+                    # One final marker check via capture-pane
+                    if shell_mode:
+                        cap = tmux_capture(target, lines=10)
+                        if cap:
+                            for cl in cap.split("\n"):
+                                m = marker_re.search(cl)
+                                if m:
+                                    exit_code = int(m.group(1))
+                                    status = "command_completed"
+                                    break
+                        if status == "command_completed":
+                            break
+                    status = "output_stable"
+                    break
+
+    finally:
+        cleanup()
+        atexit.unregister(cleanup)
+        signal.signal(signal.SIGTERM, orig_sigterm)
+        signal.signal(signal.SIGINT, orig_sigint)
+
+    duration = time.monotonic() - start
+
+    # --- Trim trailing prompt lines from text_buffer ---
+    # When a prompt was detected, the buffer may include prompt-rendering lines
+    # (e.g., starship info line before the arrow). Remove from the end.
+    if status in ("command_completed", "prompt_detected") and text_buffer:
+        while text_buffer:
+            last = text_buffer[-1].rstrip()
+            if not last:
+                text_buffer.pop()
+            elif detect_prompt_in_line(last, initial_prompt):
+                text_buffer.pop()
+            else:
+                break
+
+    # --- Capture final state for saving ---
+    # Brief settle time to let async prompt rendering finish (starship, etc.)
+    if status in ("command_completed", "prompt_detected"):
+        time.sleep(0.3)
+    final_cap = tmux_capture(target)
+    save_state(target, final_cap, initial_prompt, status=status)
+
+    # Too many cursor-positioning / erase sequences → incremental text unreliable.
+    # A few stray sequences are fine; dozens means progress bars or TUI drawing.
+    output_unreliable = heavy_seq_count > 20
+
+    # --- Helper: clean capture-pane output (strip marker and command echo) ---
+    def clean_capture(cap_text: str) -> list[str]:
+        if not cap_text:
+            return []
+        lines = cap_text.rstrip("\n").split("\n")
+        return [l for l in lines if MARKER_PREFIX not in l]
+
+    # --- Determine output to return ---
+    hint = None
+    use_capture = False
+
+    if status == "output_flood":
+        hint = "output exceeded threshold; use --scroll N to review history"
+        use_capture = True
+    elif status in ("timeout", "output_stable"):
+        if status == "timeout":
+            hint = f"total timeout ({timeout:.0f}s) reached; command may still be running"
+        else:
+            hint = f"no output for {idle_timeout:.0f}s; command may still be running"
+        use_capture = True
+    elif status == "pane_error":
+        format_output(target, mode_str, duration, status, None, [],
+                      hint="pane not found or tmux error")
+        return 1
+    elif status == "interactive_prompt":
+        hint = "pane appears to be waiting for input"
+        use_capture = True
+    elif status == "command_completed":
+        # Marker found — we know exactly what happened.
+        # Use text_buffer (even if empty = command had no output).
+        # Only fall back to capture-pane if we suspect missed output (control_heavy).
+        if output_unreliable and not text_buffer:
+            use_capture = True
+        else:
+            use_capture = False
+    elif status == "prompt_detected":
+        # Prompt reappeared but no marker — use incremental if available
+        if text_buffer and not output_unreliable:
+            use_capture = False
+        else:
+            use_capture = True
+
+    if use_capture:
+        out_lines = clean_capture(final_cap) if final_cap else text_buffer
+        format_output(target, mode_str, duration, status, exit_code,
+                      out_lines, hint=hint, capture_mode=True)
+    else:
+        format_output(target, mode_str, duration, status, exit_code,
+                      text_buffer, hint=hint)
+
+    return exit_code if exit_code is not None else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run commands in tmux panes with intelligent output monitoring.",
+        usage="tmux-exec -t <pane> [options] [command ...]",
+    )
+    parser.add_argument("-t", dest="target", required=True,
+                        help="target pane (e.g., 0:0.0 or %%5)")
+    parser.add_argument("--timeout", type=float, default=110,
+                        help="total timeout in seconds (default: 110)")
+    parser.add_argument("--idle-timeout", type=float, default=10,
+                        help="seconds of no output before returning (default: 10)")
+    parser.add_argument("--shell", action="store_true",
+                        help="force shell mode (append printf marker)")
+    parser.add_argument("--no-shell", action="store_true",
+                        help="force non-shell mode (no marker)")
+    parser.add_argument("--raw", action="store_true",
+                        help="send keys and return immediately (no monitoring)")
+    parser.add_argument("--check", action="store_true",
+                        help="return current pane state without sending anything")
+    parser.add_argument("--force", action="store_true",
+                        help="bypass pane-changed guard")
+    parser.add_argument("--scroll", type=int, default=None,
+                        help="return N lines of scrollback history")
+    parser.add_argument("command", nargs="*", help="command to execute")
+
+    args = parser.parse_args()
+
+    # --- Dispatch modes ---
+
+    if args.check:
+        return do_check(args.target, args.scroll)
+
+    if args.scroll is not None and not args.command:
+        return do_scroll(args.target, args.scroll)
+
+    command = " ".join(args.command)
+    if not command:
+        parser.print_usage(sys.stderr)
+        print("Error: no command specified", file=sys.stderr)
+        return 1
+
+    if args.raw:
+        return do_raw(args.target, command)
+
+    # --- Determine shell mode ---
+    if args.shell and args.no_shell:
+        print("Error: --shell and --no-shell are mutually exclusive", file=sys.stderr)
+        return 1
+
+    if args.shell:
+        shell_mode = True
+    elif args.no_shell:
+        shell_mode = False
+    else:
+        shell_mode = detect_shell_mode(args.target)
+
+    return do_exec(
+        target=args.target,
+        command=command,
+        shell_mode=shell_mode,
+        timeout=args.timeout,
+        idle_timeout=args.idle_timeout,
+        force=args.force,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
