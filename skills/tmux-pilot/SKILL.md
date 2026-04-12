@@ -52,15 +52,14 @@ tmux-exec -t 0:0.0 "sudo systemctl status nginx"
 
 ### Understanding the output
 
-tmux-exec returns structured output with a status line:
+tmux-exec prints a single `[tmux-exec]` status line followed by any output lines:
 
 ```
-[tmux-exec] target=0:0.0 mode=shell duration=3.2s
-[tmux-exec] status: command_completed | exit_code=0
---- output (5 lines, incremental) ---
+[tmux-exec] target=0:0.0 mode=shell status=command_completed exit=0 duration=3.2s lines=5 src=stream
 ...actual output...
---- end ---
 ```
+
+If there is no output, only the status line is printed. If a hint is relevant, it is appended after a `|` on the same line.
 
 **Status values and what to do:**
 

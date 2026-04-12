@@ -263,25 +263,20 @@ def format_output(
     hint: str | None = None,
     capture_mode: bool = False,
 ) -> None:
-    """Print structured output to stdout."""
-    header = f"[tmux-exec] target={target} mode={mode} duration={duration:.1f}s"
-    status_line = f"[tmux-exec] status: {status}"
+    """Print one compact [tmux-exec] status line, then any output lines."""
+    parts = [f"target={target}", f"mode={mode}", f"status={status}"]
     if exit_code is not None:
-        status_line += f" | exit_code={exit_code}"
-    if hint:
-        status_line += f" | hint: {hint}"
-
-    print(header)
-    print(status_line)
-
+        parts.append(f"exit={exit_code}")
+    parts.append(f"duration={duration:.1f}s")
     if lines:
-        src = "capture-pane" if capture_mode else "incremental"
-        print(f"--- output ({len(lines)} lines, {src}) ---")
-        for l in lines:
-            print(l)
-        print("--- end ---")
-    else:
-        print("--- no output ---")
+        src = "capture" if capture_mode else "stream"
+        parts.append(f"lines={len(lines)} src={src}")
+    line = "[tmux-exec] " + " ".join(parts)
+    if hint:
+        line += f" | hint: {hint}"
+    print(line)
+    for l in lines:
+        print(l)
 
 
 # ---------------------------------------------------------------------------
