@@ -348,15 +348,19 @@ def do_check(target: str, scroll: int | None) -> int:
     return 0
 
 
-def do_raw(target: str, command: str) -> int:
-    """--raw mode: send keys and return immediately."""
-    r = tmux_run("send-keys", "-t", target, command, "Enter")
+def do_raw(target: str, keys: list[str]) -> int:
+    """--raw mode: pass keys through to `tmux send-keys` verbatim, return immediately.
+
+    Each positional arg is forwarded as its own send-keys argument.  No Enter
+    is appended; include `Enter` explicitly as an arg if you need it.
+    """
+    r = tmux_run("send-keys", "-t", target, *keys)
     if r.returncode != 0:
         format_output(target, "raw", 0.0, "pane_error", None, [],
                       hint=f"send-keys failed: {r.stderr.strip()}")
         return 1
     format_output(target, "raw", 0.0, "sent", None, [],
-                  hint="keys sent, use --check to inspect pane")
+                  hint=f"sent {len(keys)} key arg(s); use --check to inspect pane")
     return 0
 
 
@@ -790,7 +794,8 @@ def main() -> int:
     parser.add_argument("--no-shell", action="store_true",
                         help="force non-shell mode (no marker)")
     parser.add_argument("--raw", action="store_true",
-                        help="send keys and return immediately (no monitoring)")
+                        help="pass positional args through to `tmux send-keys` verbatim "
+                             "(no marker, no auto-Enter, no monitoring)")
     parser.add_argument("--check", action="store_true",
                         help="return current pane state without sending anything")
     parser.add_argument("--force", action="store_true",
@@ -809,14 +814,18 @@ def main() -> int:
     if args.scroll is not None and not args.command:
         return do_scroll(args.target, args.scroll)
 
+    if args.raw:
+        if not args.command:
+            parser.print_usage(sys.stderr)
+            print("Error: --raw requires at least one key argument", file=sys.stderr)
+            return 1
+        return do_raw(args.target, args.command)
+
     command = " ".join(args.command)
     if not command:
         parser.print_usage(sys.stderr)
         print("Error: no command specified", file=sys.stderr)
         return 1
-
-    if args.raw:
-        return do_raw(args.target, command)
 
     # --- Determine shell mode ---
     if args.shell and args.no_shell:

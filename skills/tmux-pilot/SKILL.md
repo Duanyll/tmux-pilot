@@ -80,7 +80,7 @@ If there is no output, only the status line is printed. If a hint is relevant, i
 |--------|-------------|
 | `-t TARGET` | Target pane (required, e.g., `0:0.0` or `%5`) |
 | `--check` | Return current pane state without sending anything |
-| `--raw` | Send keys and return immediately (no monitoring) |
+| `--raw` | Pass following args through to `tmux send-keys` verbatim (see Phase 3) |
 | `--force` | Bypass the pane-changed guard |
 | `--shell` | Force shell mode (append printf marker for exit code) |
 | `--no-shell` | Force non-shell mode (no marker) |
@@ -205,6 +205,10 @@ tmux-exec detects interactive prompts and returns `interactive_prompt` status. W
    ```bash
    tmux-exec -t <pane> --check
    ```
+3. To cancel/abort a prompt (or any foreground process), send Ctrl-C via `--raw`:
+   ```bash
+   tmux-exec -t <pane> --raw C-c
+   ```
 
 ### Debuggers and REPLs (pdb, lldb, gdb, python, etc.)
 
@@ -228,20 +232,40 @@ tmux-exec -t <pane> "python3 -m pdb script.py"
 
 After quitting the debugger, tmux-exec detects the shell prompt and automatically restores shell mode for the next call.
 
-### Full-screen / interactive programs
+### `--raw`: sending keystrokes verbatim
 
-Programs like `vim`, `htop`, `less`, `top` don't produce linear output. Use `--raw` mode to send keystrokes:
+`--raw` is a thin wrapper around `tmux send-keys`. Every positional argument after `--raw` is forwarded to `tmux send-keys` **as-is**, with no completion marker, no output monitoring, and **no auto-appended Enter**. It returns immediately; use `--check` afterward to see what happened.
+
+This is the only way to send key names and control characters (Ctrl-C, Escape, arrow keys, etc.), and the right tool for driving full-screen programs like `vim`, `htop`, `less`, `top` that don't produce linear output.
+
+**Key arguments follow tmux send-keys naming:**
+- Control / meta: `C-c`, `C-d`, `C-l`, `M-x`
+- Named keys: `Enter`, `Escape`, `Space`, `Tab`, `BSpace`, `Up`, `Down`, `Left`, `Right`, `PageUp`, `PageDown`, `Home`, `End`, `F1`..`F12`
+- Anything else (quoted string): typed as literal characters
+
+**Common patterns:**
 
 ```bash
-# Launch the program
-tmux-exec -t <pane> --raw "htop"
+# Send Ctrl-C to cancel a prompt or running process (no Enter!)
+tmux-exec -t <pane> --raw C-c
 
-# Send keystrokes (e.g., quit)
-tmux-exec -t <pane> --raw "q"
+# Press Escape
+tmux-exec -t <pane> --raw Escape
 
-# Check what's on screen
+# Launch a full-screen program — pass the command AND Enter as separate args
+tmux-exec -t <pane> --raw htop Enter
+
+# Send a single keystroke to the running program (htop's "quit" is 'q', no Enter)
+tmux-exec -t <pane> --raw q
+
+# Multiple keys in one call — e.g., arrow down twice, then Enter
+tmux-exec -t <pane> --raw Down Down Enter
+
+# Inspect what happened
 tmux-exec -t <pane> --check
 ```
+
+**Important:** If you want the pane to actually execute what you typed (e.g., run a command), you must include `Enter` as its own argument. Forgetting it is the most common mistake. Conversely, when sending a control key like `C-c`, do **not** add `Enter` — it would generate an extra blank line after the cancel.
 
 ### Pane change guard
 
