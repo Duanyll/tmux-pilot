@@ -2,32 +2,28 @@
 
 Let Claude Code control interactive CLI programs through tmux panes.
 
-tmux-pilot provides scripts and a Claude Code skill that together allow Claude Code to execute commands in any tmux pane — local or remote (via SSH) — with intelligent output monitoring, completion detection, and structured status feedback.
+tmux-pilot is a Claude Code plugin that provides scripts and a skill for executing commands in any tmux pane — local or remote (via SSH) — with intelligent output monitoring, completion detection, and structured status feedback.
 
 ## How it works
 
 - **`tmux-exec`** — Sends commands to a target tmux pane, monitors output in real time via `pipe-pane`, and returns when the command completes, a prompt appears, or a timeout is reached. Automatically detects shell vs non-shell environments, handles interactive prompts, and provides clean filtered output with exit codes.
 - **`tmux-upload`** — Uploads a local file to the target pane by base64-encoding it and decoding on the remote side. Supports `sudo tee` for protected paths.
-- **Claude Code skill** (`.claude/commands/tmux-pilot.md`) — Teaches Claude Code how to discover tmux panes, run commands, upload files, and handle interactive situations.
+- **Claude Code skill** (`/tmux-pilot`) — Teaches Claude Code how to discover tmux panes, run commands, upload files, and handle interactive situations.
 
 ## Install
 
 ```bash
 # Clone the repo
 git clone https://github.com/duanyll/tmux-pilot.git
-cd tmux-pilot
-
-# Add the scripts to your PATH
-ln -s "$(pwd)/bin/tmux-exec" ~/.local/bin/tmux-exec
-ln -s "$(pwd)/bin/tmux-upload" ~/.local/bin/tmux-upload
 ```
 
-The Claude Code skill is automatically available when you run Claude Code inside this repo. To make it available globally, symlink it:
+Then launch Claude Code with the plugin enabled:
 
 ```bash
-mkdir -p ~/.claude/commands
-ln -s "$(pwd)/.claude/commands/tmux-pilot.md" ~/.claude/commands/tmux-pilot.md
+claude --plugin-dir /path/to/tmux-pilot
 ```
+
+The plugin automatically adds `tmux-exec` and `tmux-upload` to your PATH and installs the pre-tool hook that guards against chained calls.
 
 ## Usage
 
@@ -54,6 +50,4 @@ tmux-exec -t 0:0.0 --scroll 200
 ## Requirements
 
 - tmux
-- Python 3.10+ (for `tmux-exec`)
-- bash 4+ (for `tmux-upload`)
-- base64 (coreutils, for `tmux-upload`)
+- Python 3.10+

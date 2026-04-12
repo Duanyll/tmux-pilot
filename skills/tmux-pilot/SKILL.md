@@ -1,3 +1,8 @@
+---
+name: tmux-pilot
+description: "Interactive CLI Control via tmux — execute commands, handle interactive prompts, upload files to remote systems through tmux panes"
+---
+
 # Interactive CLI Control via tmux
 
 Execute commands and control interactive CLI programs through tmux panes using the `tmux-exec` wrapper. It handles output monitoring, completion detection, and interactive prompt detection automatically — you get structured status information so you always know what happened.

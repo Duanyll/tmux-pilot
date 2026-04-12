@@ -1,0 +1,23 @@
+{
+  "name": "tmux-pilot",
+  "version": "0.1.0",
+  "description": "Control interactive CLI programs through tmux panes with intelligent output monitoring",
+  "author": {
+    "name": "duanyll"
+  },
+  "repository": "https://github.com/duanyll/tmux-pilot",
+  "license": "MIT",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/guard-tmux-exec.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
