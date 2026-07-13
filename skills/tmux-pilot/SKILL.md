@@ -282,9 +282,20 @@ When you see `pane_changed`:
 
 For operations that may exceed the default timeout (110s):
 
-- **Increase timeout**: `tmux-exec -t <pane> --timeout 300 "long-command"` (up to 600s with Bash tool timeout)
+- **Increase timeout upfront**: `tmux-exec -t <pane> --timeout 300 "long-command"` (up to 600s with Bash tool timeout)
+- **Keep waiting after a timeout**: if a previous `tmux-exec` returned `output_stable` or `timeout`, call `tmux-exec -t <pane> --check --timeout N` to wait up to N more seconds for it to finish. This is the correct way to wait — do **not** `sleep N && tmux-exec --check`.
 - **Background on remote**: `tmux-exec -t <pane> "nohup long-command > /tmp/output.log 2>&1 &"`
-- **Check progress**: `tmux-exec -t <pane> --check`
+- **Instant snapshot**: `tmux-exec -t <pane> --check` (no `--timeout`) returns the current pane immediately.
+
+#### How `--check --timeout N` waits
+
+When `--timeout N` is passed with `--check`, tmux-exec polls the pane and returns as soon as one of these happens:
+
+- The marker from the previous exec appears → `status=command_completed` with exit code.
+- A shell/REPL prompt reappears at the bottom of the pane → `status=prompt_detected`.
+- `N` seconds elapse without either → `status=timeout` (just call `--check --timeout` again to keep waiting).
+
+**Important:** `--check --timeout` does **not** apply an idle-timeout by default. A command that hangs silently (no output) will keep being waited on until `--timeout` is hit — which is usually what you want. Only pass `--idle-timeout M` if you explicitly want to give up after M seconds of an unchanged pane.
 
 ### Reviewing scrollback
 

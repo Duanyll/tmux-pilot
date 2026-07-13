@@ -119,7 +119,7 @@ def load_state(target: str) -> dict:
     """Load saved state for a pane."""
     d = state_dir(target)
     st: dict = {}
-    for name in ("last_capture", "last_prompt", "last_status"):
+    for name in ("last_capture", "last_prompt", "last_status", "last_marker"):
         path = os.path.join(d, f"{name}.txt")
         if os.path.isfile(path):
             with open(path, "r", errors="replace") as f:
@@ -134,6 +134,7 @@ def save_state(
     capture: str | None,
     prompt: str | None,
     status: str | None = None,
+    marker: str | None = None,
 ) -> None:
     """Persist state for next invocation."""
     d = state_dir(target)
@@ -147,6 +148,9 @@ def save_state(
     if status is not None:
         with open(os.path.join(d, "last_status.txt"), "w") as f:
             f.write(status)
+    if marker is not None:
+        with open(os.path.join(d, "last_marker.txt"), "w") as f:
+            f.write(marker)
 
 
 # ---------------------------------------------------------------------------
@@ -334,18 +338,123 @@ class PipePaneMonitor:
 # Main logic
 # ---------------------------------------------------------------------------
 
-def do_check(target: str, scroll: int | None) -> int:
-    """--check mode: return current pane state."""
+def do_check(
+    target: str,
+    scroll: int | None,
+    timeout: float | None,
+    idle_timeout: float | None,
+) -> int:
+    """--check mode: return current pane state, optionally waiting for completion.
+
+    Without --timeout: instant snapshot (original behavior).
+    With --timeout N:  poll capture-pane until one of:
+        - saved marker appears (from a prior exec that may still be running)
+        - last_prompt reappears at the pane bottom (prompt_detected)
+        - pane content unchanged for --idle-timeout seconds (only if explicitly set)
+        - N seconds elapse (timeout)
+    """
     lines_arg = scroll if scroll else None
-    cap = tmux_capture(target, lines=lines_arg)
-    if cap is None:
-        format_output(target, "check", 0.0, "pane_error", None, [],
-                      hint="target pane not found")
+
+    # --- Instant mode (original behavior) ---
+    if timeout is None:
+        cap = tmux_capture(target, lines=lines_arg)
+        if cap is None:
+            format_output(target, "check", 0.0, "pane_error", None, [],
+                          hint="target pane not found")
+            return 1
+        save_state(target, cap, None)
+        out_lines = cap.rstrip("\n").split("\n")
+        format_output(target, "check", 0.0, "ok", None, out_lines, capture_mode=True)
+        return 0
+
+    # --- Wait mode ---
+    start = time.monotonic()
+    saved = load_state(target)
+    last_prompt = saved.get("last_prompt")
+    saved_marker = saved.get("last_marker") or ""
+    marker_re_wait = (
+        re.compile(re.escape(saved_marker) + r"(\d+)") if saved_marker else None
+    )
+
+    last_cap_norm: str | None = None
+    last_change_time = time.monotonic()
+    status = "timeout"
+    exit_code: int | None = None
+    final_cap: str | None = None
+
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= timeout:
+            status = "timeout"
+            break
+
+        cap = tmux_capture(target, lines=lines_arg)
+        if cap is None:
+            status = "pane_error"
+            break
+        final_cap = cap
+
+        # Marker check — the saved exec is the one we're waiting on.
+        if marker_re_wait is not None:
+            m = marker_re_wait.search(cap)
+            if m:
+                exit_code = int(m.group(1))
+                status = "command_completed"
+                break
+
+        # Prompt reappearance at pane bottom.
+        cap_lines = cap.rstrip("\n").split("\n")
+        while cap_lines and not cap_lines[-1].strip():
+            cap_lines.pop()
+        if cap_lines:
+            last_line = strip_ansi(cap_lines[-1].rstrip())
+            if detect_prompt_in_line(last_line, last_prompt):
+                status = "prompt_detected"
+                break
+
+        # Optional idle check (only when user opted in).
+        if idle_timeout is not None:
+            cap_norm = normalize_capture(cap)
+            if last_cap_norm is None or cap_norm != last_cap_norm:
+                last_cap_norm = cap_norm
+                last_change_time = time.monotonic()
+            elif time.monotonic() - last_change_time >= idle_timeout:
+                status = "output_stable"
+                break
+
+        remaining = timeout - (time.monotonic() - start)
+        time.sleep(max(0.0, min(0.5, remaining)))
+
+    duration = time.monotonic() - start
+    if final_cap is None:
+        final_cap = tmux_capture(target) or ""
+
+    # If completed or prompt reappeared, clear the saved marker so a subsequent
+    # --check --timeout doesn't immediately re-match this stale marker.
+    clear_marker = "" if status in ("command_completed", "prompt_detected") else None
+    save_state(target, final_cap, None, status=status, marker=clear_marker)
+
+    out_lines = [l for l in final_cap.rstrip("\n").split("\n") if MARKER_PREFIX not in l]
+
+    hint = None
+    if status == "timeout":
+        hint = (
+            f"waited {timeout:.0f}s; command may still be running — "
+            f"run --check --timeout N again to keep waiting"
+        )
+    elif status == "output_stable":
+        hint = (
+            f"no pane change for {idle_timeout:.0f}s; command may still be running "
+            f"— omit --idle-timeout to keep waiting until --timeout"
+        )
+    elif status == "pane_error":
+        format_output(target, "check", duration, status, None, [],
+                      hint="pane not found or tmux error")
         return 1
-    save_state(target, cap, None)
-    out_lines = cap.rstrip("\n").split("\n")
-    format_output(target, "check", 0.0, "ok", None, out_lines, capture_mode=True)
-    return 0
+
+    format_output(target, "check", duration, status, exit_code, out_lines,
+                  hint=hint, capture_mode=True)
+    return exit_code if exit_code is not None else 0
 
 
 def do_raw(target: str, keys: list[str]) -> int:
@@ -380,11 +489,15 @@ def do_exec(
     target: str,
     command: str,
     shell_mode: bool,
-    timeout: float,
-    idle_timeout: float,
+    timeout: float | None,
+    idle_timeout: float | None,
     force: bool,
 ) -> int:
     """Main execution mode: send command, monitor output, return on completion."""
+    if timeout is None:
+        timeout = 110
+    if idle_timeout is None:
+        idle_timeout = 10
     start = time.monotonic()
     mode_str = "shell" if shell_mode else "monitor"
 
@@ -715,7 +828,11 @@ def do_exec(
     if status in ("command_completed", "prompt_detected"):
         time.sleep(0.3)
     final_cap = tmux_capture(target)
-    save_state(target, final_cap, initial_prompt, status=status)
+    # Save the marker prefix only when the command may still be running — so a
+    # later `--check --timeout N` can watch for it. On clean completion, clear
+    # any stale marker from a previous call so we don't match an old one.
+    marker_to_save = marker if shell_mode and status in ("output_stable", "timeout") else ""
+    save_state(target, final_cap, initial_prompt, status=status, marker=marker_to_save)
 
     # Too many cursor-positioning / erase sequences → incremental text unreliable.
     # A few stray sequences are fine; dozens means progress bars or TUI drawing.
@@ -785,10 +902,14 @@ def main() -> int:
     )
     parser.add_argument("-t", dest="target", required=True,
                         help="target pane (e.g., 0:0.0 or %%5)")
-    parser.add_argument("--timeout", type=float, default=110,
-                        help="total timeout in seconds (default: 110)")
-    parser.add_argument("--idle-timeout", type=float, default=10,
-                        help="seconds of no output before returning (default: 10)")
+    parser.add_argument("--timeout", type=float, default=None,
+                        help="exec mode: total timeout seconds (default: 110). "
+                             "check mode: if set, wait up to N seconds for the "
+                             "previously-started command to complete.")
+    parser.add_argument("--idle-timeout", type=float, default=None,
+                        help="exec mode: seconds of no output before returning "
+                             "(default: 10). check mode: opt-in only — seconds "
+                             "of unchanged pane content before giving up.")
     parser.add_argument("--shell", action="store_true",
                         help="force shell mode (append printf marker)")
     parser.add_argument("--no-shell", action="store_true",
@@ -809,7 +930,7 @@ def main() -> int:
     # --- Dispatch modes ---
 
     if args.check:
-        return do_check(args.target, args.scroll)
+        return do_check(args.target, args.scroll, args.timeout, args.idle_timeout)
 
     if args.scroll is not None and not args.command:
         return do_scroll(args.target, args.scroll)
